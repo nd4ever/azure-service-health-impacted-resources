@@ -1,0 +1,11 @@
+# Script output (may contain subscription IDs and resource names)
+*.csv
+!examples/*.csv
+
+# Test artifacts
+tests/out/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
