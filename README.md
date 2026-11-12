@@ -136,6 +136,8 @@ Tests run offline against mocked Azure responses — no subscription needed:
 ```
 
 CI runs PSScriptAnalyzer and the tests on Windows PowerShell 5.1 and PowerShell 7 (Windows + Linux).
+The CI logic lives in [tests/Invoke-CI.ps1](tests/Invoke-CI.ps1) (`-Task Lint` or `-Task Test`); failures are
+surfaced as annotations on the workflow run summary.
 
 ## References
 
