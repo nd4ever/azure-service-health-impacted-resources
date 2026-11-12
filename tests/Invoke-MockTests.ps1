@@ -25,11 +25,11 @@ function Assert-True([bool]$Condition, [string]$Message) {
 # ---------------------------------------------------------------- fixtures
 $global:MockEvents = @(
     [pscustomobject]@{ trackingId='7Z6Y-2L8'; eventTitle='App Service maintenance';     eventType='PlannedMaintenance'; eventSubType='';           eventStatus='Active' }
-    [pscustomobject]@{ trackingId='TG2W-S4G'; eventTitle='Old maintenance';             eventType='PlannedMaintenance'; eventSubType='';           eventStatus='Resolved' }
+    [pscustomobject]@{ trackingId='TG2W-S4G'; eventTitle='Old maintenance &amp;amp; patching'; eventType='PlannedMaintenance'; eventSubType='';     eventStatus='Resolved' }  # double-encoded at source
     [pscustomobject]@{ trackingId='VNRS-RFG'; eventTitle='Dependency Agent retirement'; eventType='HealthAdvisory';     eventSubType='Retirement'; eventStatus='Active' }
     [pscustomobject]@{ trackingId='PQFS-Z1G'; eventTitle='PowerShell 7.4 end of support'; eventType='HealthAdvisory';   eventSubType='Retirement'; eventStatus='Active' }
     [pscustomobject]@{ trackingId='PQFS-Z1G'; eventTitle='PowerShell 7.4 end of support'; eventType='HealthAdvisory';   eventSubType='Retirement'; eventStatus='Active' }  # same ID in 2 subscriptions
-    [pscustomobject]@{ trackingId='MQR7-KK0'; eventTitle='SSD billing change';          eventType='HealthAdvisory';     eventSubType='';           eventStatus='Active' }
+    [pscustomobject]@{ trackingId='MQR7-KK0'; eventTitle='SSD billing & <pricing> change'; eventType='HealthAdvisory';  eventSubType='';           eventStatus='Active' }  # XML/HTML escaping
 )
 $global:MockImpacted = @(
     [pscustomobject]@{ trackingId='7Z6Y-2L8'; subscriptionId='sub-1'; resourceId='/subscriptions/sub-1/resourceGroups/rg-web/providers/Microsoft.Web/serverFarms/asp-1'; resourceType='Microsoft.Web/serverFarms'; region='centralus' }
@@ -49,7 +49,7 @@ $global:MockRecTypes = @(
 $global:MockAdvisor = @(
     [pscustomobject]@{ recTypeId='a8ffbd6c-0000-0000-0000-000000000001'; subscriptionId='sub-2'; resourceId='/subscriptions/sub-2/resourcegroups/rg-arc/providers/microsoft.hybridcompute/machines/srv-01'; resourceName='srv-01'; resourceType='Microsoft.HybridCompute/machines'; recommendation='Migrate from Dependency Agent and VM Insights Map'; retirementFeature='Dependency Agent and VM Insights Map'; retirementDate='2028-06-30' }
     [pscustomobject]@{ recTypeId='3055fad1-0000-0000-0000-000000000002'; subscriptionId='sub-1'; resourceId='/subscriptions/sub-1/resourcegroups/rg-mon/providers/microsoft.operationalinsights/workspaces/law-01'; resourceName='law-01'; resourceType='Microsoft.OperationalInsights/workspaces'; recommendation='Migrate from Dependency Agent and VM Insights Map'; retirementFeature='Dependency Agent and VM Insights Map'; retirementDate='2028-06-30' }
-    [pscustomobject]@{ recTypeId='efd285e2-0000-0000-0000-000000000004'; subscriptionId='sub-1'; resourceId='/subscriptions/sub-1/resourcegroups/rg-func/providers/microsoft.web/sites/func-01'; resourceName='func-01'; resourceType='Microsoft.Web/sites'; recommendation='Migrate your apps from PowerShell 7.4 to PowerShell 7.6'; retirementFeature='Support for PowerShell 7.4'; retirementDate='2026-11-10' }
+    [pscustomobject]@{ recTypeId='efd285e2-0000-0000-0000-000000000004'; subscriptionId='sub-1'; resourceId='/subscriptions/sub-1/resourcegroups/rg-func/providers/microsoft.web/sites/func-01'; resourceName='func-01'; resourceType='Microsoft.Web/sites'; recommendation='Migrate your apps from PowerShell 7.4 to PowerShell 7.6 &amp; later'; retirementFeature='Support for PowerShell 7.4 &amp; earlier'; retirementDate='2026-11-10' }
     [pscustomobject]@{ recTypeId='9d5717d2-0000-0000-0000-00000000000f'; subscriptionId='sub-2'; resourceId='/subscriptions/sub-2/resourcegroups/rg-arc/providers/microsoft.hybridcompute/machines/srv-02'; resourceName='srv-02'; resourceType='Microsoft.HybridCompute/machines'; recommendation='Upgrade agent'; retirementFeature=''; retirementDate='' }
 )
 $global:MockBodies = New-Object System.Collections.Generic.List[object]
@@ -112,6 +112,22 @@ function Invoke-Target([hashtable]$Params) {
     return @(Import-Csv $Params.OutCsv)
 }
 
+function Read-Xlsx([byte[]]$Bytes) {
+    # Returns @{ '<entry name>' = '<text>' } for every part in an .xlsx package
+    Add-Type -AssemblyName System.IO.Compression
+    $ms  = New-Object System.IO.MemoryStream(, $Bytes)
+    $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read)
+    $parts = @{}
+    try {
+        foreach ($e in $zip.Entries) {
+            $r = New-Object System.IO.StreamReader($e.Open())
+            try { $parts[$e.FullName] = $r.ReadToEnd() } finally { $r.Dispose() }
+        }
+    } finally { $zip.Dispose(); $ms.Dispose() }
+    return $parts
+}
+function Get-SheetRows([string]$Xml) { ([regex]::Matches($Xml, '<row ')).Count }
+
 # ---------------------------------------------------------------- tests
 Write-Host 'Parse'
 $errs = $null
@@ -162,11 +178,40 @@ Assert-True (@($rows | Where-Object { $_.source -eq 'None' }).Count -eq 2) 'even
 Assert-True (-not @($rows | Where-Object { $_.resourceName -eq 'srv-02' }).Count) 'Advisor recs without tracking ID mapping excluded'
 Assert-True (-not @($global:MockBodies | Where-Object { $_.managementGroups }).Count) 'no -ManagementGroup => tenant-wide scope'
 
+Write-Host 'Excel workbook (two worksheets)'
+$xlsxPath = Join-Path $out 'all.xlsx'
+Assert-True (Test-Path $xlsxPath) 'workbook written next to the CSV by default'
+$parts = Read-Xlsx ([IO.File]::ReadAllBytes($xlsxPath))
+foreach ($p in '[Content_Types].xml', '_rels/.rels', 'xl/workbook.xml', 'xl/_rels/workbook.xml.rels', 'xl/styles.xml', 'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml') {
+    Assert-True ($parts.ContainsKey($p)) "package part $p present"
+}
+$xmlOk = $true
+foreach ($k in @($parts.Keys)) { try { [xml]$parts[$k] | Out-Null } catch { $xmlOk = $false; Write-Host "    bad XML in ${k}: $($_.Exception.Message)" } }
+Assert-True $xmlOk 'every package part is well-formed XML'
+$wb = [xml]$parts['xl/workbook.xml']
+Assert-True ((@($wb.workbook.sheets.sheet | ForEach-Object { $_.name }) -join '|') -eq 'Affected resources|No affected resources') "sheets 'Affected resources' and 'No affected resources'"
+Assert-True ((Get-SheetRows $parts['xl/worksheets/sheet1.xml']) -eq 5) 'Affected sheet: header + 4 resource rows'
+Assert-True ((Get-SheetRows $parts['xl/worksheets/sheet2.xml']) -eq 3) 'No-affected sheet: header + 2 notifications'
+Assert-True ($parts['xl/worksheets/sheet1.xml'] -notmatch 'MQR7-KK0|VNRS-RFG') 'notifications without resources not on the Affected sheet'
+Assert-True ($parts['xl/worksheets/sheet2.xml'] -match 'MQR7-KK0' -and $parts['xl/worksheets/sheet2.xml'] -match 'VNRS-RFG') 'notifications without resources on the No-affected sheet'
+Assert-True ($parts['xl/worksheets/sheet2.xml'] -match 'SSD billing &amp; &lt;pricing&gt; change') 'cell text XML-escaped'
+Assert-True ($parts['xl/worksheets/sheet2.xml'] -notmatch '>resourceId<') 'No-affected sheet omits empty resource columns'
+Assert-True ($parts['xl/worksheets/sheet1.xml'] -match 'state="frozen"' -and $parts['xl/worksheets/sheet1.xml'] -match '<autoFilter ref="A1:Q5"/>') 'header row frozen with autofilter'
+
+$rows = @(Invoke-Target @{ All = $true; OutCsv = "$out/all2.csv"; OutXlsx = "$out/custom-name.xlsx" })
+Assert-True (Test-Path (Join-Path $out 'custom-name.xlsx')) '-OutXlsx path honored'
+Push-Location $out
+try { & $script -All -OutCsv '.\relative.csv' *> $null } finally { Pop-Location }
+Assert-True ((Test-Path (Join-Path $out 'relative.csv')) -and (Test-Path (Join-Path $out 'relative.xlsx'))) 'relative paths resolve against the PowerShell location'
+
 Write-Host '-All -IncludeResolved'
 $global:MockBodies.Clear()
 $rows = @(Invoke-Target @{ All = $true; IncludeResolved = $true; ManagementGroup = 'test-mg'; OutCsv = "$out/all-resolved.csv" })
 Assert-True ($rows.Count -eq 7) "7 rows (got $($rows.Count))"
 Assert-True (@($rows | Where-Object { $_.trackingId -eq 'TG2W-S4G' -and $_.eventStatus -eq 'Resolved' }).Count -eq 1) 'resolved event included'
+Assert-True (@($rows | Where-Object { $_.trackingId -eq 'TG2W-S4G' })[0].eventTitle -eq 'Old maintenance & patching') 'double-encoded title (&amp;amp;) decoded'
+$func = @($rows | Where-Object { $_.resourceName -eq 'func-01' })[0]
+Assert-True ($func.recommendation -eq 'Migrate your apps from PowerShell 7.4 to PowerShell 7.6 & later' -and $func.retirementFeature -eq 'Support for PowerShell 7.4 & earlier') 'Advisor text (&amp;) decoded'
 Assert-True (@($global:MockBodies | Where-Object { $_.managementGroups -contains 'test-mg' }).Count -gt 0) '-ManagementGroup passed to Resource Graph'
 
 Write-Host 'Alias and validation'
@@ -195,10 +240,16 @@ Assert-True ($mail.Auth -eq 'Bearer mi-token-for-https://communication.azure.com
 Assert-True ((@($mail.Body.recipients.to | ForEach-Object { $_.address }) -join ',') -eq 'ops@contoso.com,cloud@contoso.com') 'recipients split on ; and ,'
 Assert-True ($mail.Body.senderAddress -eq 'DoNotReply@abc.azurecomm.net') 'sender address set'
 $att = @($mail.Body.attachments)[0]
-$csvText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($att.contentInBase64))
-Assert-True ($att.contentType -eq 'text/csv' -and $att.name -eq 'mi.csv') 'CSV attached'
-Assert-True ($csvText -match 'trackingId' -and $csvText -match 'SKLP-HFZ') 'attachment contains the report'
-Assert-True ($mail.Body.content.html -match 'SKLP-HFZ' -and $mail.Body.content.html -match '<table') 'HTML summary table in body'
+Assert-True (@($mail.Body.attachments).Count -eq 1 -and $att.name -eq 'mi.xlsx' -and $att.contentType -eq 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') 'Excel workbook attached'
+$attParts = Read-Xlsx ([Convert]::FromBase64String($att.contentInBase64))
+Assert-True ($attParts['xl/worksheets/sheet1.xml'] -match 'SKLP-HFZ' -and $attParts['xl/worksheets/sheet2.xml'] -match 'MQR7-KK0') 'attachment contains both worksheets'
+$html = $mail.Body.content.html
+Assert-True ($html -match 'Notifications with affected resources \(3\)' -and $html -match 'Notifications with no affected resources \(2\)') 'email has both sections with counts'
+$iAff = $html.IndexOf('Notifications with affected resources'); $iNo = $html.IndexOf('Notifications with no affected resources')
+Assert-True ($html.IndexOf('SKLP-HFZ') -gt $iAff -and $html.IndexOf('SKLP-HFZ') -lt $iNo) 'notification with resources listed in the first section'
+Assert-True ($html.IndexOf('MQR7-KK0') -gt $iNo) 'notification without resources listed in the second section'
+Assert-True ($html -match 'SSD billing &amp; &lt;pricing&gt; change') 'titles HTML-encoded in the email'
+Assert-True ($mail.Body.content.plainText -match 'affected resources: 3 \(4 resources\)') 'plain-text body has the counts'
 
 $global:MockTokenRequests.Clear()
 Remove-Item Env:\IDENTITY_ENDPOINT, Env:\IDENTITY_HEADER
