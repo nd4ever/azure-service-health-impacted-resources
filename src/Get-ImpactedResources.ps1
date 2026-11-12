@@ -17,6 +17,13 @@
   Only prerequisite: Azure CLI signed in (az login). All calls use REST, so no az.cmd quoting issues.
   -ManagementGroup is optional; when omitted, every subscription your account can read is searched.
 
+  Runbook / unattended use: -UseManagedIdentity gets tokens from the managed identity endpoint
+  (Azure Automation, Functions, App Service, VMs and Arc servers) instead of the Azure CLI.
+  Add -EmailTo and/or -ActionGroupId (recipients = the action group's email receivers), plus -EmailFrom and
+  -AcsEndpoint, to email the CSV through Azure Communication Services Email; the identity needs the
+  Contributor role on the Communication Services resource.
+  See infra/ and deploy/ for a Bicep deployment of the whole runbook solution.
+
 .EXAMPLE
   .\Get-ImpactedResources.ps1 -TrackingId '8Q2_-MK8','TP__-G1G','1P6D-SGZ'
 .EXAMPLE
@@ -25,6 +32,11 @@
   .\Get-ImpactedResources.ps1 -All
 .EXAMPLE
   .\Get-ImpactedResources.ps1 -All -IncludeResolved -ManagementGroup 'contoso-mg' -OutCsv .\all-events.csv
+.EXAMPLE
+  # As an Azure Automation runbook: managed identity + email the CSV through Azure Communication Services
+  .\Get-ImpactedResources.ps1 -All -ManagementGroup 'contoso-mg' -UseManagedIdentity `
+      -EmailTo 'ops@contoso.com,cloud@contoso.com' -EmailFrom 'DoNotReply@xxxx.azurecomm.net' `
+      -AcsEndpoint 'https://acs-impacted.unitedstates.communication.azure.com'
 
 .NOTES
   SPDX-License-Identifier: MIT
@@ -59,7 +71,19 @@ param(
     [string]$ManagementGroup,
     [Alias('AllRetirements')][switch]$All,
     [switch]$IncludeResolved,
-    [string]$OutCsv = ".\impacted-resources-$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
+    [string]$OutCsv = ".\impacted-resources-$(Get-Date -Format 'yyyyMMdd-HHmm').csv",
+
+    # Managed identity (runbooks / unattended). Client ID only for a user-assigned identity.
+    [switch]$UseManagedIdentity,
+    [string]$ManagedIdentityClientId,
+
+    # Azure Communication Services Email. -EmailTo accepts an array or a comma/semicolon separated string.
+    [string[]]$EmailTo,
+    # Resource ID of an Azure Monitor action group; its enabled email receivers are added to the recipients.
+    [string]$ActionGroupId,
+    [string]$EmailFrom,
+    [string]$AcsEndpoint,
+    [string]$EmailSubject = 'Azure Service Health impacted resources report'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,12 +91,95 @@ if (-not $All -and -not $TrackingId) { throw 'Provide -TrackingId <id1,id2,...> 
 if ($ManagementGroup -match '[<>]') {
     throw "'$ManagementGroup' looks like a placeholder. Use your management group ID (e.g. -ManagementGroup 'contoso-mg'), or omit -ManagementGroup to search all accessible subscriptions."
 }
+
+# Recipients: accept 'a@x.com,b@x.com' (schedules pass strings) as well as arrays
+$recipients = @($EmailTo | ForEach-Object { "$_" -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($ActionGroupId -and $ActionGroupId -notmatch '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/microsoft\.insights/actionGroups/[^/]+$') {
+    throw "-ActionGroupId must be a full action group resource ID (got '$ActionGroupId')."
+}
+$sendEmail = [bool]($recipients.Count -or $ActionGroupId)
+if ($sendEmail) {
+    if (-not $EmailFrom -or -not $AcsEndpoint) { throw '-EmailTo / -ActionGroupId require -EmailFrom and -AcsEndpoint (Azure Communication Services endpoint).' }
+    if ($AcsEndpoint -notmatch '^https://[^/\s]+/?$') { throw "-AcsEndpoint must look like https://<name>.<geo>.communication.azure.com (got '$AcsEndpoint')." }
+    foreach ($a in @($recipients + $EmailFrom)) {
+        if ($a -notmatch '^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$') { throw "'$a' is not a valid email address." }
+    }
+}
+
+# In a runbook, write the CSV to the sandbox temp folder unless a path was given
+if ($UseManagedIdentity -and -not $PSBoundParameters.ContainsKey('OutCsv')) {
+    $OutCsv = Join-Path ([IO.Path]::GetTempPath()) "impacted-resources-$(Get-Date -Format 'yyyyMMdd-HHmm').csv"
+}
 if ($ManagementGroup) { Write-Host "Scope: management group '$ManagementGroup'" } else { Write-Host 'Scope: all subscriptions accessible to the signed-in account' }
 
+function Get-AccessToken([string]$Resource) {
+    if (-not $UseManagedIdentity) {
+        $t = az account get-access-token --resource $Resource --query accessToken -o tsv
+        if (-not $t) { throw "Could not get a token for $Resource. Run 'az login' first." }
+        return $t
+    }
+    $id = ''
+    if ($ManagedIdentityClientId) { $id = '&client_id=' + [uri]::EscapeDataString($ManagedIdentityClientId) }
+    if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
+        # Azure Automation, Functions, App Service, Container Apps
+        $uri = "$($env:IDENTITY_ENDPOINT)?resource=$([uri]::EscapeDataString($Resource))&api-version=2019-08-01$id"
+        $r = Invoke-RestMethod -Method Get -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER; Metadata = 'true' }
+    }
+    else {
+        # Azure VMs / hybrid runbook workers (IMDS)
+        $uri = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$([uri]::EscapeDataString($Resource))$id"
+        $r = Invoke-RestMethod -Method Get -Uri $uri -Headers @{ Metadata = 'true' }
+    }
+    if (-not $r.access_token) { throw "Managed identity returned no token for $Resource." }
+    return $r.access_token
+}
+
+function Send-AcsEmail([object[]]$Rows, [string]$CsvPath) {
+    $enc  = { param($s) [System.Net.WebUtility]::HtmlEncode("$s") }
+    $sum  = @($Rows | Group-Object trackingId | Sort-Object Name | ForEach-Object {
+        $first = $_.Group[0]
+        $res   = @($_.Group | Where-Object { $_.source -ne 'None' }).Count
+        $srcs  = (@($_.Group | Select-Object -ExpandProperty source -Unique) -join ', ')
+        "<tr><td>$(& $enc $_.Name)</td><td>$(& $enc $first.eventTitle)</td><td>$(& $enc $first.eventType)</td><td style='text-align:right'>$res</td><td>$(& $enc $srcs)</td></tr>"
+    })
+    $scope = if ($ManagementGroup) { "management group $ManagementGroup" } else { 'all accessible subscriptions' }
+    $html  = "<p>Impacted resources report for $(& $enc $scope), generated $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm')) UTC.</p>" +
+             "<p><b>$($Rows.Count)</b> row(s) across <b>$($sum.Count)</b> tracking ID(s). The full list is attached as CSV.</p>" +
+             "<table border='1' cellpadding='4' style='border-collapse:collapse;font-family:Segoe UI,Arial;font-size:12px'>" +
+             '<tr><th>Tracking ID</th><th>Title</th><th>Type</th><th>Resources</th><th>Source</th></tr>' + ($sum -join '') + '</table>'
+    $text  = "Impacted resources report for $scope. $($Rows.Count) row(s) across $($sum.Count) tracking ID(s). The full list is attached as CSV."
+
+    $body = @{
+        senderAddress = $EmailFrom
+        content       = @{ subject = $EmailSubject; plainText = $text; html = $html }
+        recipients    = @{ to = @($recipients | ForEach-Object { @{ address = $_ } }) }
+    }
+    $bytes = [IO.File]::ReadAllBytes($CsvPath)
+    if ($bytes.Length -le 7MB) {      # ACS limit is 10 MB per message after base64 encoding
+        $body.attachments = @(@{ name = [IO.Path]::GetFileName($CsvPath); contentType = 'text/csv'; contentInBase64 = [Convert]::ToBase64String($bytes) })
+    } else {
+        Write-Warning "CSV is $([math]::Round($bytes.Length / 1MB, 1)) MB; too large to attach. Sending the summary only."
+        $body.content.plainText += ' (CSV too large to attach.)'
+    }
+    $acsToken = Get-AccessToken 'https://communication.azure.com'
+    $uri = $AcsEndpoint.TrimEnd('/') + '/emails:send?api-version=2023-03-31'
+    $r = Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json' `
+         -Headers @{ Authorization = "Bearer $acsToken"; 'repeatability-request-id' = [guid]::NewGuid().ToString(); 'repeatability-first-sent' = (Get-Date).ToUniversalTime().ToString('R') } `
+         -Body ($body | ConvertTo-Json -Depth 6)
+    Write-Host "Email queued to $($recipients -join ', ') (operation $($r.id), status $($r.status))"
+}
+
 $arm   = 'https://management.azure.com'
-$token = az account get-access-token --resource $arm --query accessToken -o tsv
-if (-not $token) { throw "Could not get a token. Run 'az login' first." }
+$token = Get-AccessToken $arm
 $headers = @{ Authorization = "Bearer $token" }
+
+if ($ActionGroupId) {
+    $ag = Invoke-RestMethod -Method Get -Headers $headers -Uri "$arm$($ActionGroupId)?api-version=2023-01-01"
+    $agMails = @($ag.properties.emailReceivers | Where-Object { $_.status -ne 'Disabled' -and $_.emailAddress } | ForEach-Object { $_.emailAddress.Trim() })
+    Write-Host "Action group '$($ag.name)': $($agMails.Count) email receiver(s)"
+    $recipients = @(@($recipients + $agMails) | Sort-Object -Unique)
+    if (-not $recipients.Count) { throw "Action group '$($ag.name)' has no enabled email receivers and no -EmailTo was given." }
+}
 
 function Invoke-ArgQuery([string]$Query) {
     # Azure Resource Graph via REST, with paging
@@ -273,4 +380,5 @@ ServiceHealthResources
 
 $output | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
 Write-Host "`nSaved $($output.Count) row(s) to $OutCsv"
+if ($sendEmail) { Send-AcsEmail -Rows $output.ToArray() -CsvPath $OutCsv }
 $output | Group-Object trackingId, source | Select-Object Count, Name | Format-Table -AutoSize

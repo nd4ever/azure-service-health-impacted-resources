@@ -65,7 +65,104 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 | `-TrackingId <string[]>` | One or more tracking IDs to look up. Quote them. |
 | `-ManagementGroup <string>` | Management group **ID** to scope queries. Omit to search all subscriptions the signed-in account can read. |
 | `-IncludeResolved` | With `-All`, include resolved events (default: active only). |
-| `-OutCsv <path>` | Output path. Default: `.\impacted-resources-<yyyyMMdd-HHmm>.csv`. |
+| `-OutCsv <path>` | Output path. Default: `.\impacted-resources-<yyyyMMdd-HHmm>.csv` (temp folder with `-UseManagedIdentity`). |
+| `-UseManagedIdentity` | Get tokens from the managed identity endpoint instead of the Azure CLI (Automation, Functions, App Service, VMs, Arc). |
+| `-ManagedIdentityClientId <guid>` | Client ID of a user-assigned identity. Omit for system-assigned. |
+| `-EmailTo <string[]>` | Email the CSV to these recipients (array or `'a@x.com,b@x.com'`). Requires `-EmailFrom` and `-AcsEndpoint`. |
+| `-ActionGroupId <resourceId>` | Azure Monitor action group whose **enabled email receivers** are added to the recipients (read at each run, so edit the action group to change who gets the report). Can be combined with `-EmailTo`. |
+| `-EmailFrom <address>` | Sender on an email domain linked to your ACS resource, e.g. `DoNotReply@<guid>.azurecomm.net`. |
+| `-AcsEndpoint <url>` | Azure Communication Services endpoint, e.g. `https://acs-x.unitedstates.communication.azure.com`. |
+| `-EmailSubject <string>` | Subject line. Default: `Azure Service Health impacted resources report`. |
+
+## Run on a schedule and email the report (Azure Automation + ACS Email)
+
+The same script runs as an **Azure Automation runbook** (PowerShell 7.4) using the Automation account's
+**managed identity**, and emails the CSV through **Azure Communication Services (ACS) Email**. The email contains a
+summary table (one row per tracking ID) with the full CSV attached.
+
+```mermaid
+flowchart LR
+    S[Schedule<br/>weekly / daily] --> R[Runbook<br/>Get-ImpactedResources]
+    R -- managed identity<br/>Reader on MG --> G[Resource Graph + Advisor]
+    R -- managed identity<br/>Contributor on ACS --> A[ACS Email] --> M[Recipients<br/>CSV attached]
+```
+
+### Deploy (interactive)
+
+```powershell
+az login
+.\deploy\Deploy-ImpactedResourcesReport.ps1
+```
+
+The script asks for the management group, subscription, region and recipients, then:
+
+- **If you already have ACS** — lists the Communication Services resources you can see; pick one and pick a sender
+  address from its linked email domains.
+- **If you don't** (or choose `N`) — prompts to create a new **ACS + Email Communication Service with an
+  Azure-managed domain** (sender `DoNotReply@<guid>.azurecomm.net`).
+
+Non-interactive examples:
+
+```powershell
+# Create a new ACS, deploy, and send the first report right away
+.\deploy\Deploy-ImpactedResourcesReport.ps1 -ManagementGroup contoso-mg -SubscriptionId <sub-id> -Location eastus `
+    -EmailTo 'ops@contoso.com,cloud@contoso.com' -AcsMode new -Force -RunNow
+
+# Use an existing ACS resource and sender
+.\deploy\Deploy-ImpactedResourcesReport.ps1 -ManagementGroup contoso-mg -SubscriptionId <sub-id> -Location eastus `
+    -EmailTo ops@contoso.com -AcsMode existing `
+    -ExistingAcsResourceId /subscriptions/<sub>/resourceGroups/rg-comms/providers/Microsoft.Communication/communicationServices/acs-contoso `
+    -SenderAddress alerts@contoso.com -Force
+
+# Preview only
+.\deploy\Deploy-ImpactedResourcesReport.ps1 -ManagementGroup contoso-mg -SubscriptionId <sub-id> -Location eastus -EmailTo ops@contoso.com -AcsMode new -WhatIf
+```
+
+| Deploy parameter | Default | Description |
+|---|---|---|
+| `-ManagementGroup` | prompt | Management group to report on; the runbook identity gets **Reader** here. |
+| `-SubscriptionId` / `-Location` | prompt | Where the Automation account (and a new ACS) are created. |
+| `-ResourceGroupName` | `rg-impacted-resources-report` | Created if missing. |
+| `-AutomationAccountName` | `aa-impacted-resources` | |
+| `-EmailTo` | prompt | Comma-separated recipients. |
+| `-ActionGroup` | prompt | Action group **name** or resource ID; its email receivers are used as recipients. Use with or instead of `-EmailTo`. |
+| `-AcsMode` | prompt | `new` or `existing`. |
+| `-ExistingAcsResourceId` / `-SenderAddress` | prompt | For `existing`. |
+| `-AcsDataLocation` | `United States` | For `new`. |
+| `-ScheduleFrequency` / `-ScheduleWeekDays` / `-ScheduleTimeUtc` | `Week` / `Monday` / `13:00` | First run is tomorrow at that time (UTC). |
+| `-IncludeResolved` | off | Include resolved events. |
+| `-RunbookContentUri` | this repo, tag `v1.1.0` | Raw URL of the script to publish (point at your fork to customize). |
+| `-WhatIf` / `-Force` / `-RunNow` | | Preview, skip confirmation, start one run after deploying. |
+
+### What gets deployed ([infra/main.bicep](infra/main.bicep), management group scope)
+
+| Resource | Notes |
+|---|---|
+| Resource group + Automation account | System-assigned managed identity, local auth disabled |
+| Runtime environment `PowerShell-7-4` | No Az modules needed (the script uses REST) |
+| Runbook `Get-ImpactedResources` | Published from `runbookContentUri` |
+| Schedule + link | Runbook parameters: `-All -ManagementGroup <mg> -UseManagedIdentity -EmailTo ... -EmailFrom ... -AcsEndpoint ...` |
+| Role: **Reader** on the management group | Service Health, Advisor and Resource Graph reads |
+| `acsMode=new`: Email Communication Service, `AzureManagedDomain`, Communication Services (linked) | |
+| Role: **Contributor** on the Communication Services resource | Required for Entra ID (managed identity) auth to ACS Email |
+
+Deploy directly with the Azure CLI if you prefer:
+
+```bash
+az deployment mg create --management-group-id contoso-mg --location eastus \
+  --template-file infra/main.bicep \
+  --parameters subscriptionId=<sub-id> location=eastus emailTo=ops@contoso.com acsMode=new
+```
+
+**Who can deploy:** Owner (or Contributor + User Access Administrator) on the management group, because the template
+creates role assignments.
+
+**Redeploying:** Automation job schedules can't be updated in place. The deploy script removes the runbook's previous
+schedule link first; if you redeploy with `az deployment mg create` directly, delete the old link
+(Automation account > Schedules) to avoid duplicate runs.
+
+**Azure-managed domain limits:** the free `azurecomm.net` domain has low sending limits and is meant for testing and
+low volume. For production, add a custom domain to the Email Communication Service and use `-AcsMode existing`.
 
 ## Output
 
@@ -119,6 +216,10 @@ Windows `az.cmd` quoting issues and pages through results larger than 1,000 rows
 | `Could not get a token` | Run `az login` (and `az account show` to confirm). |
 | Script blocked by execution policy | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` and `Unblock-File`. |
 | Many `None` rows | Expected — Microsoft doesn't publish resource lists for those events. See *Reading the source column*. |
+| Runbook: `403` / `AuthorizationFailed` on Resource Graph | Reader on the management group can take a few minutes to apply after deployment. Rerun the job. |
+| Runbook: `401`/`403` from `emails:send` | The identity needs **Contributor** on the Communication Services resource (not the Email service). |
+| Runbook: `DomainNotLinked` / `InvalidSenderUserName` | `-EmailFrom` must be on a domain **linked** to that ACS resource (ACS > Email > Domains). |
+| Email arrives without attachment | CSV over ~7 MB is not attached (ACS 10 MB limit). Narrow with `-ManagementGroup`. |
 
 ## Limitations
 
@@ -135,7 +236,8 @@ Tests run offline against mocked Azure responses — no subscription needed:
 ./tests/Invoke-MockTests.ps1
 ```
 
-CI runs PSScriptAnalyzer and the tests on Windows PowerShell 5.1 and PowerShell 7 (Windows + Linux).
+Managed identity and ACS email calls are mocked too. CI runs PSScriptAnalyzer, `bicep build` + `bicep lint`
+(warnings fail the build) and the tests on Windows PowerShell 5.1 and PowerShell 7 (Windows + Linux).
 The CI logic lives in [tests/Invoke-CI.ps1](tests/Invoke-CI.ps1) (`-Task Lint` or `-Task Test`); failures are
 surfaced as annotations on the workflow run summary.
 
@@ -144,6 +246,8 @@ surfaced as annotations on the workflow run summary.
 - [Impacted resources from Azure Health Advisories](https://learn.microsoft.com/azure/service-health/impacted-resources-retirements)
 - [Service retirement alerts and actions – choosing the right signal](https://learn.microsoft.com/azure/service-health/service-retirement-alerting-guidance)
 - [Azure Resource Graph sample queries for Service Health](https://learn.microsoft.com/azure/service-health/resource-graph-samples)
+- [Azure Communication Services Email overview](https://learn.microsoft.com/azure/communication-services/concepts/email/email-overview)
+- [Azure Automation runtime environments](https://learn.microsoft.com/azure/automation/runtime-environment-overview)
 
 ## License
 

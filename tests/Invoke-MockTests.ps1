@@ -53,11 +53,30 @@ $global:MockAdvisor = @(
     [pscustomobject]@{ recTypeId='9d5717d2-0000-0000-0000-00000000000f'; subscriptionId='sub-2'; resourceId='/subscriptions/sub-2/resourcegroups/rg-arc/providers/microsoft.hybridcompute/machines/srv-02'; resourceName='srv-02'; resourceType='Microsoft.HybridCompute/machines'; recommendation='Upgrade agent'; retirementFeature=''; retirementDate='' }
 )
 $global:MockBodies = New-Object System.Collections.Generic.List[object]
+$global:MockAuth   = New-Object System.Collections.Generic.List[string]
+$global:MockEmails = New-Object System.Collections.Generic.List[object]
+$global:MockTokenRequests = New-Object System.Collections.Generic.List[string]
 
 # ---------------------------------------------------------------- mocks
 function global:az { 'fake-token' }
 function global:Invoke-RestMethod {
     param($Method, $Headers, $ContentType, $Body, $Uri)
+    if ($Uri -like 'http://mock-identity/*' -or $Uri -like 'http://169.254.169.254/*') {   # managed identity endpoint
+        $global:MockTokenRequests.Add("$Uri|$($Headers['X-IDENTITY-HEADER'])")
+        $res = [uri]::UnescapeDataString(([regex]::Match($Uri, 'resource=([^&]+)')).Groups[1].Value)
+        return [pscustomobject]@{ access_token = "mi-token-for-$res" }
+    }
+    if ($Headers -and $Headers.Authorization) { $global:MockAuth.Add($Headers.Authorization) }
+    if ($Uri -like '*/microsoft.insights/actionGroups/*') {
+        return [pscustomobject]@{ name = 'NotifyMe'; properties = [pscustomobject]@{ emailReceivers = @(
+            [pscustomobject]@{ name = 'a'; emailAddress = 'ag@contoso.com';  status = 'Enabled' }
+            [pscustomobject]@{ name = 'b'; emailAddress = 'off@contoso.com'; status = 'Disabled' }
+            [pscustomobject]@{ name = 'c'; emailAddress = 'ops@contoso.com'; status = 'Enabled' }) } }
+    }
+    if ($Uri -like '*/emails:send*') {
+        $global:MockEmails.Add([pscustomobject]@{ Uri = $Uri; Auth = $Headers.Authorization; Body = (ConvertFrom-Json $Body) })
+        return [pscustomobject]@{ id = 'op-1'; status = 'Running' }
+    }
     if ($Uri -like '*Microsoft.Advisor/metadata*') {
         $values = $global:MockRecTypes
         if ($Uri -match 'filter=(.+)$') {
@@ -106,6 +125,20 @@ Assert-True ($help.Synopsis -like '*impacted resources*') 'comment-based help is
 Assert-True (@($help.examples.example).Count -ge 3) 'help examples are present'
 Assert-True ($notes -match 'MIT License' -and $notes -match 'AS IS') 'MIT license notice embedded in help'
 
+Write-Host 'Deploy script'
+$deploy = Join-Path $repo 'deploy/Deploy-ImpactedResourcesReport.ps1'
+$errs = $null
+[System.Management.Automation.Language.Parser]::ParseFile($deploy, [ref]$null, [ref]$errs) | Out-Null
+Assert-True (-not $errs) 'deploy script parses without errors'
+$dhelp = Get-Help $deploy -Full
+Assert-True ($dhelp.Synopsis -like '*Automation runbook*') 'deploy script help is recognized'
+$dparams = (Get-Command $deploy).Parameters
+Assert-True ((@($dparams['AcsMode'].Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] })[0].ValidValues -join ',') -eq ',new,existing') 'deploy -AcsMode accepts new/existing (blank = prompt)'
+foreach ($p in 'ManagementGroup', 'EmailTo', 'ActionGroup', 'ExistingAcsResourceId', 'SenderAddress', 'WhatIf', 'RunNow') {
+    Assert-True ($dparams.ContainsKey($p)) "deploy script has -$p"
+}
+Assert-True (Test-Path (Join-Path $repo 'infra/main.bicep')) 'infra/main.bicep present'
+
 Write-Host 'Per tracking ID'
 $rows = @(Invoke-Target @{ TrackingId = @('7Z6Y-2L8','SKLP-HFZ','VNRS-RFG','ZZZZ-000','bad;id'); ManagementGroup = 'test-mg'; OutCsv = "$out/ids.csv" })
 $by = { param($t, $s) @($rows | Where-Object { $_.trackingId -eq $t -and $_.source -eq $s }) }
@@ -143,6 +176,57 @@ $msg = ''; try { & $script -All -ManagementGroup '<your-mg>' -OutCsv "$out/x.csv
 Assert-True ($msg -like '*placeholder*') 'placeholder management group rejected'
 $msg = ''; try { & $script -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
 Assert-True ($msg -like '*-TrackingId*') 'missing -TrackingId/-All rejected'
+Assert-True (-not $global:MockEmails.Count) 'no email sent without -EmailTo'
+
+Write-Host 'Managed identity + ACS email (runbook mode)'
+$env:IDENTITY_ENDPOINT = 'http://mock-identity/msi/token'; $env:IDENTITY_HEADER = 'mock-secret'
+$global:MockAuth.Clear(); $global:MockEmails.Clear(); $global:MockTokenRequests.Clear()
+$acs = 'https://acs-test.unitedstates.communication.azure.com/'
+$rows = @(Invoke-Target @{ All = $true; ManagementGroup = 'test-mg'; UseManagedIdentity = $true; ManagedIdentityClientId = '11111111-2222-3333-4444-555555555555'
+                           EmailTo = @('ops@contoso.com; cloud@contoso.com'); EmailFrom = 'DoNotReply@abc.azurecomm.net'; AcsEndpoint = $acs; OutCsv = "$out/mi.csv" })
+Assert-True ($rows.Count -eq 6) 'report content unchanged under managed identity'
+Assert-True (@($global:MockAuth | Where-Object { $_ -eq 'Bearer mi-token-for-https://management.azure.com' }).Count -gt 0) 'ARM calls use the managed identity token'
+Assert-True (-not @($global:MockAuth | Where-Object { $_ -like '*fake-token*' }).Count) 'Azure CLI not used with -UseManagedIdentity'
+Assert-True (@($global:MockTokenRequests | Where-Object { $_ -like '*client_id=11111111-2222-3333-4444-555555555555*' -and $_ -like '*|mock-secret' }).Count -gt 0) 'user-assigned client ID and X-IDENTITY-HEADER sent'
+Assert-True ($global:MockEmails.Count -eq 1) 'exactly one email sent'
+$mail = $global:MockEmails[0]
+Assert-True ($mail.Uri -eq 'https://acs-test.unitedstates.communication.azure.com/emails:send?api-version=2023-03-31') 'ACS endpoint + api-version (trailing slash trimmed)'
+Assert-True ($mail.Auth -eq 'Bearer mi-token-for-https://communication.azure.com') 'ACS call uses a communication.azure.com token'
+Assert-True ((@($mail.Body.recipients.to | ForEach-Object { $_.address }) -join ',') -eq 'ops@contoso.com,cloud@contoso.com') 'recipients split on ; and ,'
+Assert-True ($mail.Body.senderAddress -eq 'DoNotReply@abc.azurecomm.net') 'sender address set'
+$att = @($mail.Body.attachments)[0]
+$csvText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($att.contentInBase64))
+Assert-True ($att.contentType -eq 'text/csv' -and $att.name -eq 'mi.csv') 'CSV attached'
+Assert-True ($csvText -match 'trackingId' -and $csvText -match 'SKLP-HFZ') 'attachment contains the report'
+Assert-True ($mail.Body.content.html -match 'SKLP-HFZ' -and $mail.Body.content.html -match '<table') 'HTML summary table in body'
+
+$global:MockTokenRequests.Clear()
+Remove-Item Env:\IDENTITY_ENDPOINT, Env:\IDENTITY_HEADER
+$rows = @(Invoke-Target @{ TrackingId = @('7Z6Y-2L8'); UseManagedIdentity = $true; OutCsv = "$out/imds.csv" })
+Assert-True (@($global:MockTokenRequests | Where-Object { $_ -like 'http://169.254.169.254/*' }).Count -gt 0) 'falls back to IMDS when IDENTITY_ENDPOINT is absent'
+
+Write-Host 'Action group recipients'
+$global:MockEmails.Clear()
+$agId = '/subscriptions/sub-1/resourceGroups/rg-mon/providers/microsoft.insights/actionGroups/NotifyMe'
+$rows = @(Invoke-Target @{ TrackingId = @('7Z6Y-2L8'); ActionGroupId = $agId; EmailTo = 'ops@contoso.com'; EmailFrom = 'ServiceHealth@abc.azurecomm.net'; AcsEndpoint = $acs; OutCsv = "$out/ag.csv" })
+$to = @($global:MockEmails[0].Body.recipients.to | ForEach-Object { $_.address })
+Assert-True ($global:MockEmails.Count -eq 1) 'email sent with -ActionGroupId'
+Assert-True (($to -contains 'ag@contoso.com') -and ($to -contains 'ops@contoso.com')) 'action group receivers + -EmailTo combined'
+Assert-True (-not ($to -contains 'off@contoso.com')) 'disabled action group receivers skipped'
+Assert-True ($to.Count -eq 2) 'duplicate recipients removed'
+$global:MockEmails.Clear()
+$rows = @(Invoke-Target @{ TrackingId = @('7Z6Y-2L8'); ActionGroupId = $agId; EmailFrom = 'ServiceHealth@abc.azurecomm.net'; AcsEndpoint = $acs; OutCsv = "$out/ag2.csv" })
+Assert-True ($global:MockEmails.Count -eq 1) '-ActionGroupId alone (no -EmailTo) sends'
+$msg = ''; try { & $script -All -ActionGroupId 'NotifyMe' -EmailFrom 'a@b.net' -AcsEndpoint $acs -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
+Assert-True ($msg -like '*full action group resource ID*') 'action group name (not ID) rejected'
+
+Write-Host 'Email validation'
+$msg = ''; try { & $script -All -EmailTo 'a@contoso.com' -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
+Assert-True ($msg -like '*require -EmailFrom*') '-EmailTo without sender/endpoint rejected'
+$msg = ''; try { & $script -All -EmailTo 'not-an-email' -EmailFrom 'a@b.net' -AcsEndpoint $acs -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
+Assert-True ($msg -like '*not a valid email*') 'invalid recipient rejected'
+$msg = ''; try { & $script -All -EmailTo 'a@contoso.com' -EmailFrom 'a@b.net' -AcsEndpoint 'acs-test.communication.azure.com' -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
+Assert-True ($msg -like '*-AcsEndpoint must*') 'endpoint without https:// rejected'
 
 Remove-Item -Path $out -Recurse -Force -ErrorAction SilentlyContinue
 if ($script:failures) { Write-Host "`n$($script:failures) test(s) FAILED" -ForegroundColor Red; exit 1 }
