@@ -157,9 +157,30 @@ az deployment mg create --management-group-id contoso-mg --location eastus \
 **Who can deploy:** Owner (or Contributor + User Access Administrator) on the management group, because the template
 creates role assignments.
 
-**Redeploying:** Automation job schedules can't be updated in place. The deploy script removes the runbook's previous
-schedule link first; if you redeploy with `az deployment mg create` directly, delete the old link
-(Automation account > Schedules) to avoid duplicate runs.
+### Redeploying or updating an existing deployment
+
+Rerun the deploy script with the **same resource group and Automation account names** you used the first time.
+The deployment then updates the existing resources in place. If you leave them out, the defaults
+(`rg-impacted-resources-report` / `aa-impacted-resources`) are used, and if those differ from your original names you
+get a **second** Automation account and duplicate emails.
+
+```powershell
+.\deploy\Deploy-ImpactedResourcesReport.ps1 -ManagementGroup contoso-mg `
+  -SubscriptionId <sub-id> -Location eastus `
+  -ResourceGroupName <your-existing-rg> -AutomationAccountName <your-existing-automation-account> `
+  -ActionGroup <action-group-name> -AcsMode existing `
+  -ExistingAcsResourceId /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Communication/communicationServices/<acs-name> `
+  -SenderAddress <sender>@<domain>
+```
+
+- Use `-AcsMode existing` on a redeploy even if the first deployment created the ACS resource. Otherwise a new ACS
+  resource is created.
+- Omit `-RunbookContentUri` to pick up the runbook from the release tag the template points to. Pass it only to
+  publish a fork or branch.
+- Automation job schedules can't be updated in place. The deploy script removes the runbook's previous schedule link
+  first. If you redeploy with `az deployment mg create` directly, delete the old link (Automation account > Schedules)
+  to avoid duplicate runs.
+- Recipients that come from `-ActionGroup` are read on every run, so changing the action group doesn't need a redeploy.
 
 **Azure-managed domain limits:** the free `azurecomm.net` domain has low sending limits and is meant for testing and
 low volume. For production, add a custom domain to the Email Communication Service and use `-AcsMode existing`.
