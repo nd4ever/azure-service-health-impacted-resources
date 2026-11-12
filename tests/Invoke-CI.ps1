@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  CI entry point: runs PSScriptAnalyzer (-Task Lint) or the offline mock tests (-Task Test).
+  CI entry point: runs PSScriptAnalyzer + Bicep build/lint (-Task Lint) or the offline mock tests (-Task Test).
 
 .DESCRIPTION
   Keeps CI logic out of .github/workflows so it can change without editing the workflow file.
@@ -45,7 +45,7 @@ if ($Task -eq 'Lint') {
     }
     Import-Module PSScriptAnalyzer
     $findings = @()
-    foreach ($dir in 'src', 'tests') {     # -Path accepts a single path, so call once per folder
+    foreach ($dir in 'src', 'tests', 'deploy') {     # -Path accepts a single path, so call once per folder
         $findings += @(Invoke-ScriptAnalyzer -Path (Join-Path $root $dir) -Recurse -Severity Error)
     }
     foreach ($f in $findings) {
@@ -54,7 +54,28 @@ if ($Task -eq 'Lint') {
         Write-Annotation "$($f.RuleName): $($f.Message)" $rel $f.Line
     }
     Write-Host "PSScriptAnalyzer error-severity findings: $($findings.Count)"
-    if ($findings.Count) { exit 1 }
+
+    # Bicep: build + lint every template; warnings and errors both fail CI
+    $bicepIssues = 0
+    $useCli = [bool](Get-Command bicep -ErrorAction SilentlyContinue)
+    if (-not $useCli -and -not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Neither bicep nor az is installed.' }
+    if (-not $useCli) { az bicep install 2>&1 | Out-Null }
+    $main = Join-Path $root 'infra/main.bicep'
+    foreach ($verb in 'build', 'lint') {
+        $out = if ($useCli) { & bicep $verb $main $(if ($verb -eq 'build') { '--stdout' }) 2>&1 }
+               else         { & az bicep $verb --file $main $(if ($verb -eq 'build') { '--stdout' }) 2>&1 }
+        $code = $LASTEXITCODE
+        foreach ($l in @($out | ForEach-Object { "$_" } | Where-Object { $_ -match ' : (Warning|Error) ' })) {
+            Write-Host $l; $bicepIssues++
+            if ($l -match '^(.+?)\((\d+),\d+\) : (.+)$') {
+                $rel = ($Matches[1].Substring([math]::Min($root.Length, $Matches[1].Length)).TrimStart('\', '/')) -replace '\\', '/'
+                Write-Annotation $Matches[3] $rel ([int]$Matches[2])
+            } else { Write-Annotation $l }
+        }
+        if ($code) { $bicepIssues++; Write-Annotation "bicep $verb exited with $code" }
+    }
+    Write-Host "Bicep warnings/errors: $bicepIssues"
+    if ($findings.Count -or $bicepIssues) { exit 1 }
     exit 0
 }
 
