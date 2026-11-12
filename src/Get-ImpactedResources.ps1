@@ -160,12 +160,12 @@ $output = New-Object System.Collections.Generic.List[object]
 
 if ($All) {
     # 1. All Service Health events in scope (one row per tracking ID)
-    $events = Invoke-ArgQuery @"
+    $events = @(Invoke-ArgQuery @"
 ServiceHealthResources
 | where type =~ 'microsoft.resourcehealth/events'
 | project trackingId = name, eventTitle = tostring(properties.Title), eventType = tostring(properties.EventType),
           eventSubType = tostring(properties.EventSubType), eventStatus = tostring(properties.Status)
-"@
+"@)
     $evtMap = @{}
     foreach ($e in $events) {
         if (-not $e.trackingId) { continue }
@@ -177,13 +177,13 @@ ServiceHealthResources
     $hasRows = @{}
 
     # 2. Service Health impacted resources for all events (bulk)
-    $sh = Invoke-ArgQuery @"
+    $sh = @(Invoke-ArgQuery @"
 ServiceHealthResources
 | where type =~ 'microsoft.resourcehealth/events/impactedresources'
 | extend trackingId = tostring(split(split(id, '/events/')[1], '/')[0])
 | project trackingId, subscriptionId, resourceId = tostring(properties.targetResourceId),
           resourceType = tostring(properties.targetResourceType), region = tostring(properties.targetRegion)
-"@
+"@)
     $shCount = 0
     foreach ($r in $sh) {
         if (-not $r.trackingId -or -not $inScope.ContainsKey($r.trackingId)) { continue }
@@ -192,7 +192,7 @@ ServiceHealthResources
     Write-Host "Service Health impacted resources: $shCount"
 
     # 3. Advisor: every retirement recommendation type -> its tracking IDs -> affected resources
-    $types = Get-AdvisorRecTypes | Where-Object { $_.sourceProperties.serviceRetirement.serviceHealth.trackingIds }
+    $types = @(Get-AdvisorRecTypes | Where-Object { $_.sourceProperties.serviceRetirement.serviceHealth.trackingIds })
     $map = @{}; $titleMap = @{}
     foreach ($t in $types) {
         $map[$t.id.ToLower()]      = @($t.sourceProperties.serviceRetirement.serviceHealth.trackingIds)
@@ -235,8 +235,9 @@ ServiceHealthResources
           eventSubType = tostring(properties.EventSubType), eventStatus = tostring(properties.Status)
 | take 1
 "@ | Select-Object -First 1
-        # Advisor mapping for this tracking ID (retirements); also used as title fallback
-        $types = Get-AdvisorRecTypes -Filter "trackingIds/any(t: t eq '$tid')"
+        # Advisor mapping for this tracking ID (retirements); also used as title fallback.
+        # @() keeps a single result as an array: Windows PowerShell 5.1 has no .Count on a lone object.
+        $types = @(Get-AdvisorRecTypes -Filter "trackingIds/any(t: t eq '$tid')")
         if (-not $evt) {
             if ($types.Count) {
                 $evt = [pscustomobject]@{ eventTitle = $types[0].displayName; titleSource = 'Advisor'; eventType = 'HealthAdvisory'; eventSubType = 'Retirement'; eventStatus = '' }

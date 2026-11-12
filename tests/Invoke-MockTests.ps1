@@ -87,6 +87,8 @@ function global:Invoke-RestMethod {
 }
 
 function Invoke-Target([hashtable]$Params) {
+    # Callers wrap the result in @() - a function returning one row unrolls to a scalar,
+    # and Windows PowerShell 5.1 has no .Count on a single object.
     & $script @Params *> $null
     return @(Import-Csv $Params.OutCsv)
 }
@@ -105,10 +107,10 @@ Assert-True (@($help.examples.example).Count -ge 3) 'help examples are present'
 Assert-True ($notes -match 'MIT License' -and $notes -match 'AS IS') 'MIT license notice embedded in help'
 
 Write-Host 'Per tracking ID'
-$rows = Invoke-Target @{ TrackingId = @('7Z6Y-2L8','SKLP-HFZ','VNRS-RFG','ZZZZ-000','bad;id'); ManagementGroup = 'test-mg'; OutCsv = "$out/ids.csv" }
+$rows = @(Invoke-Target @{ TrackingId = @('7Z6Y-2L8','SKLP-HFZ','VNRS-RFG','ZZZZ-000','bad;id'); ManagementGroup = 'test-mg'; OutCsv = "$out/ids.csv" })
 $by = { param($t, $s) @($rows | Where-Object { $_.trackingId -eq $t -and $_.source -eq $s }) }
-Assert-True ((& $by '7Z6Y-2L8' 'ServiceHealth').Count -eq 1) '7Z6Y-2L8: 1 Service Health resource'
-Assert-True ((& $by 'SKLP-HFZ' 'Advisor').Count -eq 2)       'SKLP-HFZ: 2 Advisor resources (2 rec types)'
+Assert-True (@(& $by '7Z6Y-2L8' 'ServiceHealth').Count -eq 1) '7Z6Y-2L8: 1 Service Health resource'
+Assert-True (@(& $by 'SKLP-HFZ' 'Advisor').Count -eq 2)       'SKLP-HFZ: 2 Advisor resources (2 rec types)'
 Assert-True (@($rows | Where-Object { $_.trackingId -eq 'SKLP-HFZ' -and $_.titleSource -eq 'Advisor' -and $_.eventTitle }).Count -eq 2) 'SKLP-HFZ: title falls back to Advisor'
 Assert-True (@(& $by 'VNRS-RFG' 'None' | Where-Object { $_.note -like 'Advisor mapping exists*' }).Count -eq 1) 'VNRS-RFG: None row, mapping but no resources'
 Assert-True (@(& $by 'ZZZZ-000' 'None' | Where-Object { $_.note -like 'No resource-level data*' }).Count -eq 1) 'unknown ID: None row with explanation'
@@ -117,7 +119,7 @@ Assert-True (@(& $by '7Z6Y-2L8' 'ServiceHealth' | Where-Object { $_.resourceGrou
 
 Write-Host '-All (active only)'
 $global:MockBodies.Clear()
-$rows = Invoke-Target @{ All = $true; OutCsv = "$out/all.csv" }
+$rows = @(Invoke-Target @{ All = $true; OutCsv = "$out/all.csv" })
 Assert-True ($rows.Count -eq 6) "6 rows (got $($rows.Count))"
 Assert-True (-not @($rows | Where-Object { -not $_.eventTitle }).Count) 'every row has an eventTitle'
 Assert-True (-not @($rows | Where-Object { $_.trackingId -eq 'TG2W-S4G' }).Count) 'resolved event excluded'
@@ -125,17 +127,17 @@ Assert-True (@($rows | Where-Object { $_.trackingId -eq 'SKLP-HFZ' -and $_.note 
 Assert-True (@($rows | Where-Object { $_.trackingId -eq 'PQFS-Z1G' -and $_.titleSource -eq 'ServiceHealth' }).Count -eq 1) 'delivered retirement keeps Service Health title (no duplicate per subscription)'
 Assert-True (@($rows | Where-Object { $_.source -eq 'None' }).Count -eq 2) 'events without resource data get a None row'
 Assert-True (-not @($rows | Where-Object { $_.resourceName -eq 'srv-02' }).Count) 'Advisor recs without tracking ID mapping excluded'
-Assert-True (-not ($global:MockBodies | Where-Object { $_.managementGroups }).Count) 'no -ManagementGroup => tenant-wide scope'
+Assert-True (-not @($global:MockBodies | Where-Object { $_.managementGroups }).Count) 'no -ManagementGroup => tenant-wide scope'
 
 Write-Host '-All -IncludeResolved'
 $global:MockBodies.Clear()
-$rows = Invoke-Target @{ All = $true; IncludeResolved = $true; ManagementGroup = 'test-mg'; OutCsv = "$out/all-resolved.csv" }
+$rows = @(Invoke-Target @{ All = $true; IncludeResolved = $true; ManagementGroup = 'test-mg'; OutCsv = "$out/all-resolved.csv" })
 Assert-True ($rows.Count -eq 7) "7 rows (got $($rows.Count))"
 Assert-True (@($rows | Where-Object { $_.trackingId -eq 'TG2W-S4G' -and $_.eventStatus -eq 'Resolved' }).Count -eq 1) 'resolved event included'
 Assert-True (@($global:MockBodies | Where-Object { $_.managementGroups -contains 'test-mg' }).Count -gt 0) '-ManagementGroup passed to Resource Graph'
 
 Write-Host 'Alias and validation'
-$rows = Invoke-Target @{ AllRetirements = $true; OutCsv = "$out/alias.csv" }
+$rows = @(Invoke-Target @{ AllRetirements = $true; OutCsv = "$out/alias.csv" })
 Assert-True ($rows.Count -eq 6) '-AllRetirements alias behaves like -All'
 $msg = ''; try { & $script -All -ManagementGroup '<your-mg>' -OutCsv "$out/x.csv" *> $null } catch { $msg = $_.Exception.Message }
 Assert-True ($msg -like '*placeholder*') 'placeholder management group rejected'
