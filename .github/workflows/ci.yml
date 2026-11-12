@@ -4,22 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# CI logic lives in tests/Invoke-CI.ps1 so it can change without editing this file.
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: PSScriptAnalyzer
         shell: pwsh
-        run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $results = Invoke-ScriptAnalyzer -Path ./src, ./tests -Recurse -Severity Error
-          $results | Format-Table -AutoSize
-          if ($results) { exit 1 }
+        run: ./tests/Invoke-CI.ps1 -Task Lint
 
   test:
     strategy:
@@ -28,11 +26,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Mock tests (PowerShell 7)
         shell: pwsh
-        run: ./tests/Invoke-MockTests.ps1
+        run: ./tests/Invoke-CI.ps1 -Task Test
       - name: Mock tests (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./tests/Invoke-MockTests.ps1
+        run: ./tests/Invoke-CI.ps1 -Task Test
