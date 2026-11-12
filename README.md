@@ -3,7 +3,7 @@
 [![CI](https://github.com/nd4ever/azure-service-health-impacted-resources/actions/workflows/ci.yml/badge.svg)](https://github.com/nd4ever/azure-service-health-impacted-resources/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Turn Azure **Service Health tracking IDs** into a **per-resource list** your IT teams can act on — in one CSV, fully automated.
+Turn Azure **Service Health tracking IDs** into a **per-resource list** your IT teams can act on — in one CSV plus an Excel workbook, fully automated.
 
 ## Why this exists
 
@@ -66,6 +66,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 | `-ManagementGroup <string>` | Management group **ID** to scope queries. Omit to search all subscriptions the signed-in account can read. |
 | `-IncludeResolved` | With `-All`, include resolved events (default: active only). |
 | `-OutCsv <path>` | Output path. Default: `.\impacted-resources-<yyyyMMdd-HHmm>.csv` (temp folder with `-UseManagedIdentity`). |
+| `-OutXlsx <path>` | Excel workbook with two worksheets (see [Output](#output)). Default: same path and name as `-OutCsv`, with `.xlsx`. |
 | `-UseManagedIdentity` | Get tokens from the managed identity endpoint instead of the Azure CLI (Automation, Functions, App Service, VMs, Arc). |
 | `-ManagedIdentityClientId <guid>` | Client ID of a user-assigned identity. Omit for system-assigned. |
 | `-EmailTo <string[]>` | Email the CSV to these recipients (array or `'a@x.com,b@x.com'`). Requires `-EmailFrom` and `-AcsEndpoint`. |
@@ -77,14 +78,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ## Run on a schedule and email the report (Azure Automation + ACS Email)
 
 The same script runs as an **Azure Automation runbook** (PowerShell 7.4) using the Automation account's
-**managed identity**, and emails the CSV through **Azure Communication Services (ACS) Email**. The email contains a
-summary table (one row per tracking ID) with the full CSV attached.
+**managed identity**, and emails the report through **Azure Communication Services (ACS) Email**. The email has two
+sections, **Notifications with affected resources** (with a resource count per tracking ID) and **Notifications with no
+affected resources**, and the Excel workbook is attached.
 
 ```mermaid
 flowchart LR
     S[Schedule<br/>weekly / daily] --> R[Runbook<br/>Get-ImpactedResources]
     R -- managed identity<br/>Reader on MG --> G[Resource Graph + Advisor]
-    R -- managed identity<br/>Contributor on ACS --> A[ACS Email] --> M[Recipients<br/>CSV attached]
+    R -- managed identity<br/>Contributor on ACS --> A[ACS Email] --> M[Recipients<br/>workbook attached]
 ```
 
 ### Deploy (interactive)
@@ -131,7 +133,7 @@ Non-interactive examples:
 | `-AcsDataLocation` | `United States` | For `new`. |
 | `-ScheduleFrequency` / `-ScheduleWeekDays` / `-ScheduleTimeUtc` | `Week` / `Monday` / `13:00` | First run is tomorrow at that time (UTC). |
 | `-IncludeResolved` | off | Include resolved events. |
-| `-RunbookContentUri` | this repo, tag `v1.1.0` | Raw URL of the script to publish (point at your fork to customize). |
+| `-RunbookContentUri` | this repo, tag `v1.2.0` | Raw URL of the script to publish (point at your fork to customize). |
 | `-WhatIf` / `-Force` / `-RunNow` | | Preview, skip confirmation, start one run after deploying. |
 
 ### What gets deployed ([infra/main.bicep](infra/main.bicep), management group scope)
@@ -187,7 +189,15 @@ low volume. For production, add a custom domain to the Email Communication Servi
 
 ## Output
 
-One row per resource per tracking ID. See [examples/sample-output.csv](examples/sample-output.csv).
+Each run writes two files:
+
+| File | Contents |
+|---|---|
+| **CSV** (`-OutCsv`) | Every row: one per resource per tracking ID, plus one `None` row per notification with no resource data. See [examples/sample-output.csv](examples/sample-output.csv). |
+| **Excel workbook** (`-OutXlsx`) | Two worksheets. **Affected resources**: notifications with at least one affected resource, one row per resource, all columns below. **No affected resources**: notifications with no resource-level data, one row per notification (`trackingId`, `eventTitle`, `titleSource`, `eventType`, `eventSubType`, `eventStatus`, `note`). Header row frozen, filters on. |
+
+The workbook is written natively, so Excel and extra PowerShell modules aren't needed, including in the runbook.
+Titles and recommendation text are HTML-decoded (Service Health and Advisor sometimes return `&amp;` or `&amp;amp;`).
 
 | Column | Description |
 |---|---|
@@ -240,7 +250,7 @@ Windows `az.cmd` quoting issues and pages through results larger than 1,000 rows
 | Runbook: `403` / `AuthorizationFailed` on Resource Graph | Reader on the management group can take a few minutes to apply after deployment. Rerun the job. |
 | Runbook: `401`/`403` from `emails:send` | The identity needs **Contributor** on the Communication Services resource (not the Email service). |
 | Runbook: `DomainNotLinked` / `InvalidSenderUserName` | `-EmailFrom` must be on a domain **linked** to that ACS resource (ACS > Email > Domains). |
-| Email arrives without attachment | CSV over ~7 MB is not attached (ACS 10 MB limit). Narrow with `-ManagementGroup`. |
+| Email arrives without attachment | A workbook over ~7 MB is not attached (ACS 10 MB limit). Narrow with `-ManagementGroup`. |
 
 ## Limitations
 

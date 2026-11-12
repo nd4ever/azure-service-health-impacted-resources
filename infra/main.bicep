@@ -34,7 +34,7 @@ param automationAccountName string = 'aa-impacted-resources'
 param runbookName string = 'Get-ImpactedResources'
 
 @description('Raw URL of src/Get-ImpactedResources.ps1 that is published as the runbook. Pin a release tag or point at your fork.')
-param runbookContentUri string = 'https://raw.githubusercontent.com/nd4ever/azure-service-health-impacted-resources/v1.1.0/src/Get-ImpactedResources.ps1'
+param runbookContentUri string = 'https://raw.githubusercontent.com/nd4ever/azure-service-health-impacted-resources/v1.2.0/src/Get-ImpactedResources.ps1'
 
 param tags object = {
   solution: 'impacted-resources-report'
